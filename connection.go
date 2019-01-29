@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"sync"
 	"time"
@@ -186,8 +185,6 @@ type Connection struct {
 	closeNetworkCalled atomic.Int32
 	// stoppedExchanges is atomically set when exchanges are stopped due to error.
 	stoppedExchanges atomic.Uint32
-	// pendingMethods is the number of methods running that may block closing of sendCh.
-	pendingMethods atomic.Int64
 	// remotePeerAddress is used as a cache for remote peer address parsed into individual
 	// components that can be used to set peer tags on OpenTracing Span.
 	remotePeerAddress peerAddressComponents
@@ -387,12 +384,6 @@ func (c *Connection) callOnExchangeChange() {
 
 // ping sends a ping message and waits for a ping response.
 func (c *Connection) ping(ctx context.Context) error {
-	if !c.pendingExchangeMethodAdd() {
-		// Connection is closed, no need to do anything.
-		return ErrInvalidConnectionState
-	}
-	defer c.pendingExchangeMethodDone()
-
 	req := &pingReq{id: c.NextMessageID()}
 	mex, err := c.outbound.newExchange(ctx, c.opts.FramePool, req.messageType(), req.ID(), 1)
 	if err != nil {
@@ -419,12 +410,6 @@ func (c *Connection) handlePingRes(frame *Frame) bool {
 
 // handlePingReq responds to the pingReq message with a pingRes.
 func (c *Connection) handlePingReq(frame *Frame) {
-	if !c.pendingExchangeMethodAdd() {
-		// Connection is closed, no need to do anything.
-		return
-	}
-	defer c.pendingExchangeMethodDone()
-
 	if state := c.readState(); state != connectionActive {
 		c.protocolError(frame.Header.ID, errConnNotActive{"ping on incoming", state})
 		return
@@ -740,30 +725,10 @@ func (c *Connection) updateLastActivity(frame *Frame) {
 	}
 }
 
-// pendingExchangeMethodAdd returns whether the method that is trying to
-// add a message exchange can continue.
-func (c *Connection) pendingExchangeMethodAdd() bool {
-	return c.pendingMethods.Inc() > 0
-}
-
-// pendingExchangeMethodDone should be deferred by a method called
-// pendingExchangeMessageAdd.
-func (c *Connection) pendingExchangeMethodDone() {
-	c.pendingMethods.Dec()
-}
-
-// closeSendCh waits till there are no other goroutines that may try to write
+// closeStopCh waits till there are no other goroutines that may try to write
 // to sendCh.
 // We accept connID on the stack so can more easily debug panics or leaked goroutines.
-func (c *Connection) closeSendCh(connID uint32) {
-	// Wait till all methods that may add exchanges are done running.
-	// When they are done, we set the value to a negative value which
-	// will ensure that if any other methods start that may add exchanges
-	// they will fail due to closed connection.
-	for !c.pendingMethods.CAS(0, math.MinInt32) {
-		time.Sleep(time.Millisecond)
-	}
-
+func (c *Connection) closeStopCh(connID uint32) {
 	close(c.stopCh)
 }
 
@@ -824,7 +789,7 @@ func (c *Connection) checkExchanges() {
 	if updated != 0 {
 		// If the connection is closed, we can safely close the channel.
 		if updated == connectionClosed {
-			go c.closeSendCh(c.connID)
+			c.closeStopCh(c.connID)
 		}
 
 		c.log.WithFields(
